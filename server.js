@@ -1,12 +1,15 @@
 require('dotenv').config();
 
 const express = require('express');
-const mysql = require('mysql');
+const mysql = require('mysql2');
 const bodyParser = require('body-parser');
 const path = require('path');
-const bcrypt = require('bcryptjs');
+const bcrypt = require('bcrypt');
 const session = require('express-session');
 const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const winston = require('winston');
+const morgan = require('morgan');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -18,7 +21,28 @@ const {
     DB_NAME,
     SESSION_SECRET,
     JWT_SECRET,
+    NODE_ENV,
 } = process.env;
+
+// Create a Winston logger instance
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.Console(),
+        new winston.transports.File({ filename: 'logs/server.log' })
+    ]
+});
+
+// Use Morgan to log HTTP requests, and integrate with Winston
+app.use(morgan('combined', {
+    stream: {
+        write: (message) => logger.info(message.trim())
+    }
+}));
 
 // MySQL connection
 const db = mysql.createConnection({
@@ -30,22 +54,46 @@ const db = mysql.createConnection({
 
 db.connect((err) => {
     if (err) {
-        console.error('Error connecting to the database:', err);
+        logger.error('Error connecting to the database:', err);
         return;
     }
-    console.log('Connected to database');
+    logger.info('Connected to database');
 });
 
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Set up session middleware
+// Set up session middleware with session expiration and secure cookies
 app.use(session({
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: true,
-    cookie: { maxAge: 60000 } // Session expires in 1 minute (adjust as needed)
+    cookie: {
+        maxAge: 30 * 60 * 1000, // Session expires in 30 minutes of inactivity
+        secure: NODE_ENV === 'production' // Set secure to true in production
+    }
 }));
+
+// Middleware to auto-logout users after session expiration
+app.use((req, res, next) => {
+    if (req.session) {
+        // Reset the session expiration time on every request
+        req.session._garbage = Date();
+        req.session.touch();
+    }
+    next();
+});
+
+// Rate limiting middleware
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 requests per windowMs
+    message: 'Too many requests from this IP, please try again after 15 minutes'
+});
+
+// Apply rate limiting to login and signup routes
+app.use('/login', limiter);
+app.use('/signup', limiter);
 
 // Serve static files (except welcome.html)
 app.use(express.static(path.join(__dirname, 'public')));
@@ -88,19 +136,26 @@ const verifyAdminJWT = (req, res, next) => {
 // Handle user registration
 app.post('/signup', async (req, res) => {
     const { username, email, password } = req.body;
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
     const checkUserQuery = 'SELECT * FROM users WHERE username = ?';
     const insertUserQuery = 'INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)';
 
     db.query(checkUserQuery, [username], (err, results) => {
-        if (err) throw err;
+        if (err) {
+            logger.error('Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
         if (results.length > 0) {
-            res.status(400).send('Username already taken');
+            return res.status(400).send('Username already taken');
         } else {
             const role = (username === 'admin') ? 'admin' : 'user';
             db.query(insertUserQuery, [username, email, hashedPassword, role], (err, result) => {
-                if (err) throw err;
-                res.status(200).send('Registration successful');
+                if (err) {
+                    logger.error('Database error:', err);
+                    return res.status(500).json({ error: 'Database error' });
+                }
+                return res.status(200).send('Registration successful');
             });
         }
     });
@@ -112,7 +167,10 @@ app.post('/login', (req, res) => {
     const query = 'SELECT * FROM users WHERE username = ?';
 
     db.query(query, [username], async (err, results) => {
-        if (err) throw err;
+        if (err) {
+            logger.error('Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
         if (results.length > 0) {
             const user = results[0];
             const passwordIsValid = await bcrypt.compare(password, user.password);
@@ -127,12 +185,12 @@ app.post('/login', (req, res) => {
                 }
 
                 // Redirect to /welcome after successful login
-                res.redirect('/welcome');
+                return res.redirect('/welcome');
             } else {
-                res.status(400).send('Invalid username or password');
+                return res.status(400).send('Invalid username or password');
             }
         } else {
-            res.status(400).send('Invalid username or password');
+            return res.status(400).send('Invalid username or password');
         }
     });
 });
@@ -148,9 +206,8 @@ app.get('/api/users', verifyAdminJWT, (req, res) => {
 
     db.query(query, (err, results) => {
         if (err) {
-            console.error('Error fetching user data:', err);
-            res.status(500).send('Server error');
-            return;
+            logger.error('Error fetching user data:', err);
+            return res.status(500).send('Server error');
         }
         res.json(results); // Return all non-admin users' data
     });
@@ -160,6 +217,7 @@ app.get('/api/users', verifyAdminJWT, (req, res) => {
 app.post('/logout', (req, res) => {
     req.session.destroy((err) => {
         if (err) {
+            logger.error('Failed to log out:', err);
             return res.status(500).send('Failed to log out');
         }
         res.status(200).send('Logged out');
@@ -167,5 +225,5 @@ app.post('/logout', (req, res) => {
 });
 
 app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
+    logger.info(`Server running at http://localhost:${port}`);
 });
